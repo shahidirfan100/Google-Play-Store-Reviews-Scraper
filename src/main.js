@@ -1,3 +1,6 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
@@ -50,23 +53,106 @@ function sanitizeRecord(record) {
     return sanitizeValue(record) || {};
 }
 
-function extractAppIdFromUrlOrString(value) {
-    if (!value || typeof value !== 'string') return null;
-    const candidate = value.trim();
-    if (!candidate) return null;
+function readStringInput(value) {
+    return typeof value === 'string' ? value.trim() : '';
+}
 
-    const packageMatch = candidate.match(/^[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+$/);
-    if (packageMatch) return packageMatch[0];
+function firstDefinedValue(...values) {
+    for (const value of values) {
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed) return trimmed;
+            continue;
+        }
+        if (value !== undefined && value !== null) return value;
+    }
+    return undefined;
+}
 
+function getRuntimeInputValue(input, schemaFallback, inputFallback, names) {
+    return firstDefinedValue(
+        ...names.map((name) => input[name]),
+        ...names.map((name) => schemaFallback[name]),
+        ...names.map((name) => inputFallback[name]),
+    );
+}
+
+async function readJsonFileSafe(filePath) {
     try {
-        const url = new URL(candidate.replace(/&amp;/g, '&'));
-        if (url.searchParams.get('id')) return url.searchParams.get('id');
-    } catch {
-        // noop
+        const raw = await readFile(filePath, 'utf8');
+        return JSON.parse(raw);
+    } catch (error) {
+        log.warning(`Could not read ${filePath}: ${error.message}`);
+        return {};
+    }
+}
+
+async function loadSchemaFallback() {
+    const schemaPath = path.join(process.cwd(), '.actor', 'input_schema.json');
+    const schema = await readJsonFileSafe(schemaPath);
+    const properties = schema?.properties;
+    if (!properties || typeof properties !== 'object') return {};
+
+    const fallback = {};
+    for (const [key, config] of Object.entries(properties)) {
+        if (!config || typeof config !== 'object') continue;
+        if (config.prefill !== undefined) {
+            fallback[key] = config.prefill;
+            continue;
+        }
+        if (config.default !== undefined) fallback[key] = config.default;
     }
 
-    const fallbackMatch = candidate.match(/[?&]id=([a-zA-Z0-9._-]+)/i) || candidate.match(/id=([a-zA-Z0-9._-]+)/i);
-    return fallbackMatch ? fallbackMatch[1] : null;
+    return fallback;
+}
+
+async function loadInputJsonFallback() {
+    const inputPath = path.join(process.cwd(), 'INPUT.json');
+    return readJsonFileSafe(inputPath);
+}
+
+function extractAppIdFromUrlOrString(value) {
+    if (!value || typeof value !== 'string') return null;
+    let candidate = value.trim();
+    if (!candidate) return null;
+
+    candidate = candidate.replace(/&amp;/g, '&');
+
+    // Auto-heal encoded links pasted from wrappers or redirect URLs.
+    for (let i = 0; i < 3; i++) {
+        try {
+            const decoded = decodeURIComponent(candidate);
+            if (decoded === candidate) break;
+            candidate = decoded;
+        } catch {
+            break;
+        }
+    }
+
+    const directPackageMatch = candidate.match(/^[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+$/);
+    if (directPackageMatch) return directPackageMatch[0];
+
+    const urlCandidates = [candidate];
+    if (/^play\.google\.com\//i.test(candidate)) urlCandidates.push(`https://${candidate}`);
+
+    for (const urlCandidate of urlCandidates) {
+        try {
+            const parsedUrl = new URL(urlCandidate);
+            for (const [key, paramValue] of parsedUrl.searchParams.entries()) {
+                if (key.toLowerCase() !== 'id') continue;
+                const idCandidate = readStringInput(paramValue);
+                if (idCandidate.match(/^[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+$/)) return idCandidate;
+            }
+        } catch {
+            // noop
+        }
+    }
+
+    const idQueryMatch = candidate.match(/[?&]id=([a-zA-Z0-9._-]+)/i) || candidate.match(/\bid=([a-zA-Z0-9._-]+)/i);
+    if (idQueryMatch?.[1]) return idQueryMatch[1];
+
+    const inlinePackageMatch = candidate.match(/\b([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+)\b/);
+    return inlinePackageMatch?.[1] || null;
 }
 
 async function getProxyUrl(proxyConfiguration) {
@@ -226,29 +312,31 @@ function mapReview(rawReview, { appId, lang, country, sort, sourceUrl, sourceKey
 
 async function main() {
     const input = (await Actor.getInput()) || {};
-    const {
-        url,
-        keyword,
-        appId: appIdInput,
-        results_wanted = 20,
-        max_pages = 10,
-        sort = 'newest',
-        lang = 'en',
-        country = 'us',
-        proxyConfiguration,
-    } = input;
+    const schemaFallback = await loadSchemaFallback();
+    const inputFallback = await loadInputJsonFallback();
 
-    const totalWanted = toPositiveInt(results_wanted, 20);
-    const maxPages = toPositiveInt(max_pages, 10);
-    const normalizedSort = String(sort || 'newest').toLowerCase();
+    const url = getRuntimeInputValue(input, schemaFallback, inputFallback, ['url']);
+    const keyword = getRuntimeInputValue(input, schemaFallback, inputFallback, ['keyword']);
+    const resultsWantedInput = getRuntimeInputValue(input, schemaFallback, inputFallback, ['results_wanted', 'resultsWanted']);
+    const maxPagesInput = getRuntimeInputValue(input, schemaFallback, inputFallback, ['max_pages', 'maxPages']);
+    const sortInput = getRuntimeInputValue(input, schemaFallback, inputFallback, ['sort']);
+    const langInput = getRuntimeInputValue(input, schemaFallback, inputFallback, ['lang']);
+    const countryInput = getRuntimeInputValue(input, schemaFallback, inputFallback, ['country']);
+    const proxyConfigurationInput = getRuntimeInputValue(input, schemaFallback, inputFallback, ['proxyConfiguration']);
+
+    const totalWanted = toPositiveInt(resultsWantedInput, 20);
+    const maxPages = toPositiveInt(maxPagesInput, 10);
+    const normalizedSort = String(sortInput || 'newest').toLowerCase();
     const sortCode = SORT_MAP[normalizedSort] || SORT_MAP.newest;
+    const normalizedLang = readStringInput(langInput) || 'en';
+    const normalizedCountry = readStringInput(countryInput) || 'us';
 
-    const proxyConf = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : undefined;
-    const appIdFromDirectInput = extractAppIdFromUrlOrString(appIdInput || url || '');
+    const proxyConf = proxyConfigurationInput ? await Actor.createProxyConfiguration(proxyConfigurationInput) : undefined;
+    const appIdFromDirectInput = extractAppIdFromUrlOrString(url || '');
     const appId = appIdFromDirectInput || (keyword ? await resolveAppIdFromKeyword({
-        keyword: String(keyword).trim(),
-        lang: String(lang).trim() || 'en',
-        country: String(country).trim() || 'us',
+        keyword: readStringInput(keyword),
+        lang: normalizedLang,
+        country: normalizedCountry,
         proxyConfiguration: proxyConf,
     }) : null);
 
@@ -269,8 +357,8 @@ async function main() {
 
         const { reviews, nextToken } = await fetchReviewsPage({
             appId,
-            lang: String(lang).trim() || 'en',
-            country: String(country).trim() || 'us',
+            lang: normalizedLang,
+            country: normalizedCountry,
             sortCode,
             pageSize,
             continuationToken,
@@ -290,8 +378,8 @@ async function main() {
 
             const mapped = mapReview(rawReview, {
                 appId,
-                lang: String(lang).trim() || 'en',
-                country: String(country).trim() || 'us',
+                lang: normalizedLang,
+                country: normalizedCountry,
                 sort: normalizedSort,
                 sourceUrl: typeof url === 'string' ? url : undefined,
                 sourceKeyword: typeof keyword === 'string' ? keyword : undefined,
